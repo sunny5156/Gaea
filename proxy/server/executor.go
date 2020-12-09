@@ -19,6 +19,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/XiaoMi/Gaea/backend"
@@ -36,15 +37,18 @@ import (
 const (
 	// master comments
 	masterComment = "/*master*/"
+	// general query log variable
+	gaeaGeneralLogVariable = "gaea_general_log"
 )
 
 // SessionExecutor is bound to a session, so requests are serializable
 type SessionExecutor struct {
 	manager *Manager
 
-	namespace string
-	user      string
-	db        string
+	namespace  string
+	user       string
+	db         string
+	clientAddr string
 
 	status       uint16
 	lastInsertID uint64
@@ -53,7 +57,7 @@ type SessionExecutor struct {
 	charset          string
 	sessionVariables *mysql.SessionVariables
 
-	txConns map[string]*backend.PooledConnection
+	txConns map[string]backend.PooledConnect
 	txLock  sync.Mutex
 
 	stmtID uint32
@@ -149,7 +153,7 @@ func newSessionExecutor(manager *Manager) *SessionExecutor {
 
 	return &SessionExecutor{
 		sessionVariables: mysql.NewSessionVariables(),
-		txConns:          make(map[string]*backend.PooledConnection),
+		txConns:          make(map[string]backend.PooledConnect),
 		stmts:            make(map[uint32]*Stmt),
 		parser:           parser.New(),
 		status:           initClientConnStatus,
@@ -190,6 +194,15 @@ func (se *SessionExecutor) setStringSessionVariable(name string, valueStr string
 	}
 
 	return se.sessionVariables.Set(name, valueStr)
+}
+
+func (se *SessionExecutor) setGeneralLogVariable(valueStr string) error {
+	v, err := strconv.Atoi(valueStr)
+	if err != nil {
+		return errors.ErrInvalidArgument
+	}
+	atomic.StoreUint32(&ProcessGeneralLog, uint32(v))
+	return nil
 }
 
 // GetLastInsertID return last_inert_id
@@ -325,10 +338,10 @@ func (se *SessionExecutor) ExecuteCommand(cmd byte, data []byte) Response {
 	}
 }
 
-func (se *SessionExecutor) getBackendConns(sqls map[string]map[string][]string, fromSlave bool) (pcs map[string]*backend.PooledConnection, err error) {
-	pcs = make(map[string]*backend.PooledConnection)
+func (se *SessionExecutor) getBackendConns(sqls map[string]map[string][]string, fromSlave bool) (pcs map[string]backend.PooledConnect, err error) {
+	pcs = make(map[string]backend.PooledConnect)
 	for sliceName := range sqls {
-		var pc *backend.PooledConnection
+		var pc backend.PooledConnect
 		pc, err = se.getBackendConn(sliceName, fromSlave)
 		if err != nil {
 			return
@@ -338,7 +351,7 @@ func (se *SessionExecutor) getBackendConns(sqls map[string]map[string][]string, 
 	return
 }
 
-func (se *SessionExecutor) getBackendConn(sliceName string, fromSlave bool) (pc *backend.PooledConnection, err error) {
+func (se *SessionExecutor) getBackendConn(sliceName string, fromSlave bool) (pc backend.PooledConnect, err error) {
 	if !se.isInTransaction() {
 		slice := se.GetNamespace().GetSlice(sliceName)
 		return slice.GetConn(fromSlave, se.GetNamespace().GetUserProperty(se.user))
@@ -346,7 +359,7 @@ func (se *SessionExecutor) getBackendConn(sliceName string, fromSlave bool) (pc 
 	return se.getTransactionConn(sliceName)
 }
 
-func (se *SessionExecutor) getTransactionConn(sliceName string) (pc *backend.PooledConnection, err error) {
+func (se *SessionExecutor) getTransactionConn(sliceName string) (pc backend.PooledConnect, err error) {
 	se.txLock.Lock()
 	defer se.txLock.Unlock()
 
@@ -361,10 +374,14 @@ func (se *SessionExecutor) getTransactionConn(sliceName string) (pc *backend.Poo
 
 		if !se.isAutoCommit() {
 			if err = pc.SetAutoCommit(0); err != nil {
+				pc.Close()
+				pc.Recycle()
 				return
 			}
 		} else {
 			if err = pc.Begin(); err != nil {
+				pc.Close()
+				pc.Recycle()
 				return
 			}
 		}
@@ -375,7 +392,7 @@ func (se *SessionExecutor) getTransactionConn(sliceName string) (pc *backend.Poo
 	return
 }
 
-func (se *SessionExecutor) executeInSlice(reqCtx *util.RequestContext, pc *backend.PooledConnection, sql string) ([]*mysql.Result, error) {
+func (se *SessionExecutor) executeInSlice(reqCtx *util.RequestContext, pc backend.PooledConnect, sql string) ([]*mysql.Result, error) {
 	startTime := time.Now()
 	r, err := pc.Execute(sql)
 	se.manager.RecordBackendSQLMetrics(reqCtx, se.namespace, sql, pc.GetAddr(), startTime, err)
@@ -387,7 +404,7 @@ func (se *SessionExecutor) executeInSlice(reqCtx *util.RequestContext, pc *backe
 	return []*mysql.Result{r}, err
 }
 
-func (se *SessionExecutor) recycleBackendConn(pc *backend.PooledConnection, rollback bool) {
+func (se *SessionExecutor) recycleBackendConn(pc backend.PooledConnect, rollback bool) {
 	if pc == nil {
 		return
 	}
@@ -403,7 +420,7 @@ func (se *SessionExecutor) recycleBackendConn(pc *backend.PooledConnection, roll
 	pc.Recycle()
 }
 
-func (se *SessionExecutor) recycleBackendConns(pcs map[string]*backend.PooledConnection, rollback bool) {
+func (se *SessionExecutor) recycleBackendConns(pcs map[string]backend.PooledConnect, rollback bool) {
 	if se.isInTransaction() {
 		return
 	}
@@ -419,7 +436,7 @@ func (se *SessionExecutor) recycleBackendConns(pcs map[string]*backend.PooledCon
 	}
 }
 
-func initBackendConn(pc *backend.PooledConnection, phyDB string, charset string, collation mysql.CollationID, sessionVariables *mysql.SessionVariables) error {
+func initBackendConn(pc backend.PooledConnect, phyDB string, charset string, collation mysql.CollationID, sessionVariables *mysql.SessionVariables) error {
 	if err := pc.UseDB(phyDB); err != nil {
 		return err
 	}
@@ -443,7 +460,7 @@ func initBackendConn(pc *backend.PooledConnection, phyDB string, charset string,
 	return nil
 }
 
-func (se *SessionExecutor) executeInMultiSlices(reqCtx *util.RequestContext, pcs map[string]*backend.PooledConnection,
+func (se *SessionExecutor) executeInMultiSlices(reqCtx *util.RequestContext, pcs map[string]backend.PooledConnect,
 	sqls map[string]map[string][]string) ([]*mysql.Result, error) {
 
 	if len(pcs) != len(sqls) {
@@ -468,7 +485,7 @@ func (se *SessionExecutor) executeInMultiSlices(reqCtx *util.RequestContext, pcs
 
 	rs := make([]interface{}, resultCount)
 
-	f := func(reqCtx *util.RequestContext, rs []interface{}, i int, execSqls map[string][]string, pc *backend.PooledConnection) {
+	f := func(reqCtx *util.RequestContext, rs []interface{}, i int, execSqls map[string][]string, pc backend.PooledConnect) {
 		for db, sqls := range execSqls {
 			err := initBackendConn(pc, db, se.GetCharset(), se.GetCollationID(), se.GetVariables())
 			if err != nil {
@@ -591,7 +608,29 @@ func createShowDatabaseResult(dbs []string) *mysql.Result {
 	}
 
 	plan.GenerateSelectResultRowData(result)
+	return result
+}
 
+func createShowGeneralLogResult() *mysql.Result {
+	r := new(mysql.Resultset)
+
+	field := &mysql.Field{}
+	field.Name = hack.Slice(gaeaGeneralLogVariable)
+	r.Fields = append(r.Fields, field)
+
+	var value string
+	if OpenProcessGeneralQueryLog() {
+		value = "ON"
+	} else {
+		value = "OFF"
+	}
+	r.Values = append(r.Values, []interface{}{value})
+	result := &mysql.Result{
+		AffectedRows: 1,
+		Resultset:    r,
+	}
+
+	plan.GenerateSelectResultRowData(result)
 	return result
 }
 
@@ -652,7 +691,7 @@ func (se *SessionExecutor) commit() (err error) {
 		pc.Recycle()
 	}
 
-	se.txConns = make(map[string]*backend.PooledConnection)
+	se.txConns = make(map[string]backend.PooledConnect)
 	return
 }
 
@@ -669,7 +708,7 @@ func (se *SessionExecutor) rollback() (err error) {
 		pc.Recycle()
 	}
 
-	se.txConns = make(map[string]*backend.PooledConnection)
+	se.txConns = make(map[string]backend.PooledConnect)
 	return
 }
 
@@ -698,7 +737,7 @@ func (se *SessionExecutor) ExecuteSQL(reqCtx *util.RequestContext, slice, db, sq
 
 	if len(rs) == 0 {
 		msg := fmt.Sprintf("result is empty")
-		log.Warn("[server] Session handleUnsupport: %s, sql: %s", msg, sql)
+		log.Warn("[server] Session handle Unsupport: %s, sql: %s", msg, sql)
 		return nil, mysql.NewError(mysql.ErrUnknown, msg)
 	}
 	return rs[0], nil
