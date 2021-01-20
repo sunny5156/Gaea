@@ -85,22 +85,24 @@ func TestExecute(t *testing.T) {
 	//slice-0
 	ctx := context.Background()
 	slice0MasterConn := new(mocks.PooledConnect)
+	slice0MasterConn.On("GetConnectionID").Return(int64(1))
 	slice0MasterPool.On("Get", ctx).Return(slice0MasterConn, nil).Once()
 	slice0MasterConn.On("UseDB", "db_mycat_0").Return(nil)
 	slice0MasterConn.On("SetCharset", "utf8", mysql.CharsetIds["utf8"]).Return(false, nil)
 	slice0MasterConn.On("SetSessionVariables", mysql.NewSessionVariables()).Return(false, nil)
 	slice0MasterConn.On("GetAddr").Return("127.0.0.1:3306")
-	slice0MasterConn.On("Execute", "SELECT * FROM `tbl_mycat` WHERE `k`=0").Return(expectResult1, nil)
+	slice0MasterConn.On("Execute", "SELECT * FROM `tbl_mycat` WHERE `k`=0", defaultMaxSqlResultSize).Return(expectResult1, nil)
 	slice0MasterConn.On("Recycle").Return(nil)
 
 	//slice-1
 	slice1MasterConn := new(mocks.PooledConnect)
+	slice1MasterConn.On("GetConnectionID").Return(int64(2))
 	slice1MasterPool.On("Get", ctx).Return(slice1MasterConn, nil).Once()
 	slice1MasterConn.On("UseDB", "db_mycat_2").Return(nil)
 	slice1MasterConn.On("SetCharset", "utf8", mysql.CharsetIds["utf8"]).Return(false, nil)
 	slice1MasterConn.On("SetSessionVariables", mysql.NewSessionVariables()).Return(false, nil)
 	slice1MasterConn.On("GetAddr").Return("127.0.0.1:3306")
-	slice1MasterConn.On("Execute", "SELECT * FROM `tbl_mycat` WHERE `k`=0").Return(expectResult2, nil)
+	slice1MasterConn.On("Execute", "SELECT * FROM `tbl_mycat` WHERE `k`=0", defaultMaxSqlResultSize).Return(expectResult2, nil)
 	slice1MasterConn.On("Recycle").Return(nil)
 
 	sqls := map[string]map[string][]string{
@@ -258,7 +260,8 @@ encrypt_key=1234abcd5678efg*
             "rw_split": 1
         }
     ],
-    "default_slice": "slice-0"
+    "default_slice": "slice-0",
+	"max_sql_execute_time": 0
 }`
 
 	//加载proxy配置

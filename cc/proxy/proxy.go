@@ -95,12 +95,15 @@ func PrepareConfig(host, name string, cfg *models.CCConfig) error {
 
 // CommitConfig commit phase of config change
 func CommitConfig(host, name string, cfg *models.CCConfig) error {
+	fmt.Print(name)
 	c, err := newProxyClient(host, cfg.ProxyUserName, cfg.ProxyPassword)
 	if err != nil {
 		log.Fatal("create proxy client failed, %v", err)
 		return err
 	}
 	err = c.CommitConfig(name)
+	fmt.Print(host)
+	fmt.Print(err)
 	if err != nil {
 		log.Fatal("commit proxy config failed, %v", err)
 		return err
